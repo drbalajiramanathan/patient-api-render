@@ -8,7 +8,7 @@ from huggingface_hub import InferenceClient
 HF_TOKEN = os.environ.get("HF_TOKEN")
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 
-# --- Global variable for the client, initialized as None for delayed loading ---
+# --- Global variable for the client, for delayed loading ---
 client = None
 
 def get_inference_client():
@@ -18,18 +18,17 @@ def get_inference_client():
         print("Initializing InferenceClient for the first time...")
         if not HF_TOKEN:
             print("ERROR: HF_TOKEN secret not found!")
-            raise ValueError("HF_TOKEN environment variable not set.")
+            raise gr.Error("HF_TOKEN secret is not configured on the server.")
         try:
             client = InferenceClient(model=MODEL_ID, token=HF_TOKEN)
             print("InferenceClient initialized successfully.")
         except Exception as e:
             print(f"FATAL: Error initializing InferenceClient: {e}")
-            client = None # Ensure client stays None on failure
-            raise # Re-raise the exception to stop the process
+            raise gr.Error(f"Could not initialize AI model client: {e}")
     return client
 
 def build_json_prompt(diagnosis, age, comorbidities):
-    """Creates the detailed instruction prompt to generate the JSON data."""
+    """Creates the prompt to generate the JSON data."""
     comorbidity_list = ", ".join(comorbidities) if comorbidities else "None"
     return f"""
     You are a clinical data simulator. Your task is to generate a realistic 7-day hospital
@@ -57,8 +56,8 @@ def build_json_prompt(diagnosis, age, comorbidities):
     ]}}
     """
 
-def generate_trajectory_logic_api(diagnosis, age, comorbidities):
-    """Function called by the API. Generates and returns both JSON and a summary."""
+def generate_trajectory_and_summary(diagnosis, age, comorbidities):
+    """Generates and returns both the JSON data and a layman's summary."""
     raw_json_response = ""
     try:
         inference_client = get_inference_client()
@@ -74,7 +73,7 @@ def generate_trajectory_logic_api(diagnosis, age, comorbidities):
 
         # --- Step 2: Generate the layman's summary ---
         summary_prompt = f"""
-        Summarize the key trend in the following clinical data in one simple, easy-to-understand sentence for a non-medical person.
+        Based on the following clinical data, write a one-sentence summary for a non-medical person explaining the patient's overall progress.
         Start the sentence with "The synthetic patient...".
         
         Data: {json.dumps(json_output)}
@@ -85,36 +84,50 @@ def generate_trajectory_logic_api(diagnosis, age, comorbidities):
         )
         summary_text = summary_response_obj.choices[0].message.content.strip()
 
-        # Gradio returns multiple outputs as a tuple
+        # Gradio handles multiple outputs by returning a tuple
         return json_output, summary_text
 
     except Exception as e:
-        print(f"Error in API logic: {e}")
-        error_json = {"error": str(e), "raw_response_for_debugging": raw_json_response}
-        error_summary = "An error occurred while generating the trajectory."
-        return error_json, error_summary
+        print(f"Error in generation logic: {e}")
+        error_message = f"An error occurred: {e}. Raw AI response was: {raw_json_response}"
+        # Raise a Gradio-specific error to display it nicely in the UI
+        raise gr.Error(error_message)
 
-# --- Gradio UI Setup (for testing on Render) ---
-with gr.Blocks() as demo:
-    gr.Markdown("# Synthetic Patient Trajectory API 🏥")
-    gr.Markdown("Test UI for the generation endpoint.")
+# --- Gradio UI Layout ---
+with gr.Blocks(theme=gr.themes.Soft(), css=".gradio-container {max-width: 800px !important; margin: auto !important;}") as demo:
+    gr.Markdown("# Interactive Synthetic Patient Generator")
+    gr.Markdown("Select patient parameters and generate a simulated 7-day hospital trajectory using a Large Language Model.")
 
     with gr.Row():
-        diag_input = gr.Dropdown(label="Admission Diagnosis", choices=["Pneumonia", "Heart Failure Exacerbation", "Post-Op Hip Replacement", "Sepsis"])
-        age_input = gr.Slider(label="Patient Age", minimum=18, maximum=100, value=65)
+        diag_input = gr.Dropdown(label="Admission Diagnosis", choices=["Pneumonia", "Heart Failure Exacerbation", "Post-Op Hip Replacement", "Sepsis"], value="Pneumonia")
+        age_input = gr.Slider(label="Patient Age", minimum=18, maximum=100, value=65, step=1)
 
     comorbid_input = gr.CheckboxGroup(label="Comorbidities", choices=["Diabetes", "Hypertension", "COPD", "Smoker"])
-    submit_btn = gr.Button("Generate Test Data")
     
-    # Define the two outputs for the UI
-    json_output_ui = gr.JSON(label="Generated JSON Output")
-    summary_output_ui = gr.Textbox(label="Layman's Summary Output", interactive=False)
+    submit_btn = gr.Button("Generate Trajectory", variant="primary")
 
+    # --- ADDED: The Information Callout using Accordion ---
+    with gr.Accordion("How It Works (Technical Details)", open=False):
+        gr.Markdown(
+            """
+            This tool leverages a Large Language Model (LLM), `meta-llama/Meta-Llama-3-8B-Instruct`, accessed via an API. When you click "Generate," the user inputs are sent to the backend.
+            
+            1.  **JSON Generation:** The backend uses **structured prompt engineering** to create a highly specific prompt, constraining the LLM to act as a clinical simulator and return only a valid JSON object representing the 7-day trajectory.
+            2.  **Summary Generation:** Upon receiving the valid JSON, the backend makes a second API call. It feeds the generated JSON back to the LLM with a new set of instructions: to summarize the data's trend in a single, non-technical sentence.
+            3.  **Display:** The backend returns both the structured JSON and the summary text to be displayed in the respective output boxes below.
+            """
+        )
+
+    # --- ADDED: The two output components ---
+    gr.Markdown("## Generated Trajectory")
+    summary_output_ui = gr.Textbox(label="Layman's Summary", interactive=False, placeholder="A simple summary of the patient's progress will appear here...")
+    json_output_ui = gr.JSON(label="Raw JSON Data")
+
+    # Connect the button to the function and map to the two outputs
     submit_btn.click(
-        fn=generate_trajectory_logic_api,
+        fn=generate_trajectory_and_summary,
         inputs=[diag_input, age_input, comorbid_input],
-        outputs=[json_output_ui, summary_output_ui], # Gradio maps the function's tuple output here
-        api_name="predict"
+        outputs=[json_output_ui, summary_output_ui] # The order matches the function's return order
     )
 
 # --- Launch Gradio Server for Render ---
@@ -122,5 +135,4 @@ with gr.Blocks() as demo:
 server_port = int(os.environ.get('PORT', 10000))
 print(f"Attempting to launch Gradio on 0.0.0.0:{server_port}")
 
-# Launch specifying host 0.0.0.0 and the port Render provides
 demo.launch(server_name="0.0.0.0", server_port=server_port)
